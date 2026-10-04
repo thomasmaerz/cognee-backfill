@@ -1,153 +1,292 @@
+<div align="center">
+
 # cognee-backfill
 
-![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)
-![Docker](https://img.shields.io/badge/docker-composed-2496ED?logo=docker&logoColor=white)
-![Cognee](https://img.shields.io/badge/memory-cognee_1.x-7C3AED)
-![Kuzu](https://img.shields.io/badge/graph-kuzu-FF6F00)
-![LanceDB](https://img.shields.io/badge/vectors-lancedb-00B588)
-![SQLite](https://img.shields.io/badge/store-sqlite-003B57?logo=sqlite&logoColor=white)
-![OpenAI-compatible](https://img.shields.io/badge/LLM-openai_compatible-10A37F?logo=openai&logoColor=white)
-![License](https://img.shields.io/badge/license-MIT-green)
-![Stdlib](https://img.shields.io/badge/connector_deps-stdlib_only-blue)
+### Distill years of AI coding history into durable, local-first memory.
 
-Turn years of AI coding-assistant history into a **distilled, junk-free knowledge graph** — running **100% on local models**. No cloud, no API bills, no raw-transcript indexing.
+Extract the decisions, fixes, workflows, and gotchas worth keeping.<br>
+Skip the chatter, aborted attempts, reasoning traces, and raw log noise.
 
-Your assistant's past sessions hold decisions, fixes, and hard-won gotchas. But backfilling them naively (embed every message!) produces a bloated, noisy, expensive mess. `cognee-backfill` does it the disciplined way: **distill first, remember only what's worth keeping.**
+[![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)](https://www.docker.com/)
+[![Cognee](https://img.shields.io/badge/Memory-Cognee-7C3AED)](https://github.com/topoteretes/cognee)
+[![Local models](https://img.shields.io/badge/Models-Local_First-10A37F?logo=openai&logoColor=white)](#local-models)
+[![License](https://img.shields.io/badge/License-MIT-2EA44F)](LICENSE)
 
+**[Quick start](#quick-start)** · **[How it works](#how-it-works)** · **[Technical wiki](https://github.com/thomasmaerz/cognee-backfill/wiki)** · **[Connector roadmap](#connector-roadmap)**
+
+</div>
+
+---
+
+`cognee-backfill` converts coding-assistant session history into a compact
+[Cognee](https://github.com/topoteretes/cognee) knowledge graph. It does not
+blindly embed every message. Each session is first distilled by a local LLM;
+only durable knowledge is passed to Cognee for graph extraction, embeddings,
+and recall.
+
+> **Current connector:** OpenCode SQLite history. The pipeline is designed for
+> additional connectors, including Claude Code, Cursor, Cline, and generic
+> JSONL exports.
+
+## How it works
+
+```mermaid
+flowchart LR
+    source[(Assistant<br/>history)]
+
+    subgraph distill[Phase 1 - Distill]
+        direction LR
+        extract[Read-only<br/>connector]
+        scrub[Normalize, bound<br/>and scrub secrets]
+        llm[Local LLM<br/>distillation]
+        gate{Worth<br/>keeping?}
+        notes[(Persisted<br/>Markdown notes)]
+        junk[Junk skipped]
+
+        extract --> scrub --> llm --> gate
+        gate -->|Yes| notes
+        gate -->|No| junk
+    end
+
+    subgraph remember[Phase 2 - Remember]
+        direction LR
+        ingest[Cognee<br/>remember]
+        graph[Entities and<br/>relationships]
+        vectors[Local<br/>embeddings]
+        stores[(Kuzu + LanceDB<br/>+ SQLite)]
+
+        ingest --> graph --> vectors --> stores
+    end
+
+    recall[Graph and<br/>hybrid recall]
+
+    source --> extract
+    notes --> ingest
+    stores --> recall
 ```
-┌──────────────┐   read-only    ┌───────────────────┐  distilled notes  ┌────────────────┐
-│  assistant    │ ───────────▶ │  Phase 1: DISTILL │ ─────────────────▶ │ Phase 2:       │
-│  history DB   │  transcripts │  local LLM filter │   (junk skipped)   │ REMEMBER into  │
-│ (opencode… )  │  + scrub     │  decisions/fixes  │                    │ Cognee graph   │
-└──────────────┘              └───────────────────┘                    └───────┬────────┘
-                                                                              │ entities,
-                                                                              │ relations,
-                                                                              │ vectors
-                                                                              ▼
-                                                                     ┌────────────────┐
-                                                                     │ recall: graph  │
-                                                                     │ + hybrid search│
-                                                                     └────────────────┘
-```
 
-## Why not just index everything?
+### Why distill first?
 
-| Naive backfill | This pipeline |
+| Naive transcript indexing | `cognee-backfill` |
 |---|---|
-| Embeds 100% of messages, incl. greetings, aborted attempts, log dumps | LLM distills each session to decisions / patterns / gotchas / errors |
-| Reasoning traces and tool output pollute retrieval | Head+tail sampling keeps outcomes; junk sessions skipped pre-LLM |
-| Secrets leak into the store | Regex scrubbing before anything leaves the DB |
-| One giant uninterrupted job | Crash-safe: progress + docs on disk, resume any time with zero loss |
+| Embeds greetings, false starts, and log dumps | Keeps decisions, fixes, patterns, and project context |
+| Lets tool output dominate retrieval | Bounds every field and samples long sessions intelligently |
+| Stores raw reasoning traces | Produces concise, structured knowledge notes |
+| Reprocesses everything after interruption | Persists notes and progress for lossless resume |
+| Risks sending secrets downstream | Scrubs common credentials before the LLM boundary |
 
 ## Quick start
 
-**Prereqs:** Docker, Python 3.10+, and a local OpenAI-compatible server ([oMLX](https://github.com/jundot/omlx), Ollama, LM Studio, or vLLM) with a chat model and an embedding model loaded.
+### 1. Prerequisites
+
+- Python 3.10+
+- Docker with Compose
+- A local OpenAI-compatible inference server
+- One chat model and one embedding model loaded
+
+Tested with [oMLX](https://github.com/jundot/omlx). Ollama, LM Studio, and
+vLLM work when their OpenAI-compatible endpoints accept the configured model
+IDs and request extensions.
+
+### 2. Start the local stack
 
 ```bash
 git clone https://github.com/thomasmaerz/cognee-backfill.git
 cd cognee-backfill
-cp .env.example .env   # fill in LLM_BASE_URL + LLM_API_KEY
-docker compose up -d   # Cognee API :8010, web UI :3010
-export LLM_BASE_URL=http://127.0.0.1:8000 LLM_API_KEY=...
 
-# 1. Look at what you have
-python3 backfill.py --stats
+cp .env.example .env
+# Edit .env: set LLM_API_KEY and confirm model IDs/endpoints.
 
-# 2. Smoke test (isolated dataset, delete after)
-python3 backfill.py --limit 3 --dataset kb_smoke --recall "what was decided about X?"
-
-# 3. Full run (resumable — Ctrl-C any time, re-run to continue)
-nohup python3 backfill.py --dataset knowledge_base > backfill.log 2>&1 &
-./monitor.sh &   # hourly snapshots -> monitor.log
-
-# 4. When extraction completes: enrich + verify
-python3 backfill.py --dataset knowledge_base --improve --recall "your test question"
+docker compose up -d
+curl -f http://localhost:8010/health
 ```
 
-Browse the graph at `http://localhost:3010` (sign in with the local-dev
-`default_user@example.com` / `default_password` — localhost only).
+| Service | URL |
+|---|---|
+| Cognee UI | http://localhost:3010 |
+| Cognee API | http://localhost:8010 |
+| Swagger API docs | http://localhost:8010/docs |
+
+The bundled UI uses the local-development credentials
+`default_user@example.com` / `default_password`. Keep this stack bound to
+localhost unless you replace that development posture.
+
+### 3. Inspect and smoke-test the source
+
+```bash
+export LLM_BASE_URL=http://127.0.0.1:8000
+export LLM_API_KEY='your-local-server-key'
+
+python3 backfill.py --stats
+
+# Test only three sessions in an isolated dataset.
+python3 backfill.py \
+  --limit 3 \
+  --dataset kb_smoke \
+  --recall "What durable decisions appear in these sessions?"
+```
+
+Review the generated notes in `var/distilled/` and delete the smoke dataset
+before starting the complete run.
+
+### 4. Run the resumable backfill
+
+```bash
+nohup python3 backfill.py --dataset knowledge_base \
+  > backfill.log 2>&1 < /dev/null &
+echo $! > backfill.pid
+
+nohup ./monitor.sh >/dev/null 2>&1 < /dev/null &
+echo $! > monitor.pid
+```
+
+Stop and restart the same command at any time. Accepted notes are persisted to
+`var/distilled/<session-id>.md`; `progress.json` records pipeline state.
+
+### 5. Enrich and verify
+
+After Cognee reports that all documents completed processing:
+
+```bash
+python3 backfill.py \
+  --dataset knowledge_base \
+  --improve \
+  --recall \
+    "Which authentication decisions were made?" \
+    "Which recurring failures have known fixes?"
+```
+
+See the **[Operations guide](https://github.com/thomasmaerz/cognee-backfill/wiki/Operations)**
+for monitoring, backups, cleanup, and verification criteria.
+
+## Pipeline guarantees
+
+| Guarantee | Implementation |
+|---|---|
+| Source isolation | SQLite is opened with `mode=ro`; connectors never mutate history |
+| Resume safety | Notes reach disk before their state becomes `distilled` |
+| Explicit junk filtering | Only an exact model response of `JUNK` is discarded |
+| Retryable failures | Distillation and submission errors remain eligible for retry |
+| Secret defense-in-depth | Common keys, tokens, passwords, and private-key markers are redacted |
+| Local-first execution | LLM, embeddings, graph, vectors, and metadata can stay on one machine |
+
+## Local models
+
+The connector and Cognee use the same local OpenAI-compatible server by
+default, but route their requests independently:
+
+```mermaid
+flowchart TB
+    connector[Python connector] -->|LLM_BASE_URL| distillModel[Distillation model]
+    cognee[Cognee container] -->|LLM_DOCKER_ENDPOINT| graphModel[Structured extraction model]
+    cognee -->|LLM_DOCKER_ENDPOINT| embedModel[Embedding model]
+
+    distillModel --> server[Local inference server]
+    graphModel --> server
+    embedModel --> server
+```
+
+Reasoning-capable Qwen models require a hard thinking-mode switch for reliable
+schema output. The connector sends
+`chat_template_kwargs.enable_thinking=false`, while Cognee forwards the same
+setting through `LLM_ARGS`. Read the
+**[thinking-preamble guide](https://github.com/thomasmaerz/cognee-backfill/wiki/Thinking-preamble)**
+before changing model families.
+
+### Core configuration
+
+| Variable / flag | Default | Purpose |
+|---|---|---|
+| `LLM_BASE_URL` | `http://127.0.0.1:8000` | Inference server as seen by the connector |
+| `LLM_DOCKER_ENDPOINT` | `http://host.docker.internal:8000/v1` | Same server as seen by Cognee |
+| `LLM_API_KEY` | none | Local server bearer token |
+| `DISTILL_MODEL` / `--model` | Qwen3.6-35B-A3B MLX alias | Session distillation model |
+| `DISABLE_THINKING` | `true` | Send the Qwen-compatible hard switch |
+| `COGNEE_API_URL` | `http://localhost:8010` | Cognee API endpoint |
+| `OPENCODE_DB` | `~/.local/share/opencode/opencode.db` | Read-only OpenCode source |
+| `--concurrency` | `4` | Parallel distillation workers |
+| `--limit`, `--offset` | unset | Smoke testing and manual sharding |
+
+The complete model, embedding, and structured-output matrix lives in
+**[Configuration](https://github.com/thomasmaerz/cognee-backfill/wiki/Configuration)**.
+
+## Technology stack
+
+| | Technology | Responsibility |
+|:---:|---|---|
+| <img src="https://cdn.simpleicons.org/python/3776AB" width="20" alt="Python"> | **Python 3.10+** | Dependency-free connector, checkpoint state, and HTTP client |
+| <img src="https://cdn.simpleicons.org/docker/2496ED" width="20" alt="Docker"> | **Docker Compose** | Reproducible Cognee API and web UI |
+| 🧠 | **Cognee** | Knowledge extraction, enrichment, provenance, and recall |
+| <img src="https://cdn.simpleicons.org/sqlite/003B57" width="20" alt="SQLite"> | **SQLite** | OpenCode history and Cognee relational metadata |
+| 🕸️ | **Kuzu** | Embedded knowledge graph |
+| 🧭 | **LanceDB** | Embedded vector index |
+| <img src="https://cdn.simpleicons.org/openai/412991" width="20" alt="OpenAI-compatible API"> | **OpenAI-compatible API** | Local model transport for chat and embeddings |
+
+## Connector roadmap
+
+| Connector | Status | Source format |
+|---|:---:|---|
+| **OpenCode** | ✅ Available | `session` / `message` / `part` SQLite tables |
+| Claude Code | 🛠 Planned | `~/.claude/projects/` JSONL |
+| Cursor / Windsurf | 🛠 Planned | Agent transcript exports |
+| Cline / Continue | 🛠 Planned | Extension storage / exports |
+| Generic JSONL | 🛠 Planned | Normalized external ETL format |
+
+Every connector follows the same contract:
+
+```text
+extract read-only history -> normalize and scrub -> distill -> persist -> submit
+```
+
+See **[Adding a connector](https://github.com/thomasmaerz/cognee-backfill/wiki/Adding-a-connector)**
+for the interface, fixtures, invariants, and acceptance criteria.
+
+## Live capture after the backfill
+
+Historical ingestion and ongoing memory are separate concerns. After the
+backfill, Cognee's OpenCode plugin can capture new sessions and bridge them
+into the same dataset:
+
+```json
+{
+  "plugin": [
+    [
+      "file:/path/to/cognee-opencode",
+      {
+        "baseUrl": "http://localhost:8010",
+        "datasetName": "knowledge_base"
+      }
+    ]
+  ]
+}
+```
+
+Build the plugin from
+[`topoteretes/cognee-integrations`](https://github.com/topoteretes/cognee-integrations/tree/main/integrations/opencode),
+then restart OpenCode.
 
 ## Documentation
 
-- [Architecture](https://github.com/thomasmaerz/cognee-backfill/wiki/Architecture) — stages, state machine, storage, and failure boundaries
-- [Configuration](https://github.com/thomasmaerz/cognee-backfill/wiki/Configuration) — models, embeddings, ports, and concurrency
-- [Operations](https://github.com/thomasmaerz/cognee-backfill/wiki/Operations) — test, launch, monitor, pause, resume, back up, and clean up
-- [OpenCode connector](https://github.com/thomasmaerz/cognee-backfill/wiki/OpenCode-connector) — source schema and transcript reconstruction
-- [Adding a connector](https://github.com/thomasmaerz/cognee-backfill/wiki/Adding-a-connector) — contract for upcoming ingestion lines
-- [Thinking-preamble](https://github.com/thomasmaerz/cognee-backfill/wiki/Thinking-preamble) — reliable Qwen/reasoning-model structured output
-- [Security and privacy](https://github.com/thomasmaerz/cognee-backfill/wiki/Security-and-privacy) — source isolation, scrubbing, and retention
+| Guide | Covers |
+|---|---|
+| **[Architecture](https://github.com/thomasmaerz/cognee-backfill/wiki/Architecture)** | Data flow, state machine, storage, and failure boundaries |
+| **[Configuration](https://github.com/thomasmaerz/cognee-backfill/wiki/Configuration)** | Models, embeddings, ports, concurrency, and persistence |
+| **[Operations](https://github.com/thomasmaerz/cognee-backfill/wiki/Operations)** | Smoke tests, launch, monitoring, pause/resume, backup, cleanup |
+| **[OpenCode connector](https://github.com/thomasmaerz/cognee-backfill/wiki/OpenCode-connector)** | Source schema, transcript reconstruction, and known limits |
+| **[Adding a connector](https://github.com/thomasmaerz/cognee-backfill/wiki/Adding-a-connector)** | Adapter contract and quality gates for future sources |
+| **[Thinking preamble](https://github.com/thomasmaerz/cognee-backfill/wiki/Thinking-preamble)** | Safe structured extraction with reasoning-capable models |
+| **[Security and privacy](https://github.com/thomasmaerz/cognee-backfill/wiki/Security-and-privacy)** | Source isolation, scrubbing, network boundaries, retention |
 
-## Stack
+## Security
 
-| | Component | Role |
-|---|---|---|
-| <img src="https://cdn.simpleicons.org/python/3776AB" width="18" alt="Python"> | Python 3.10+ | Dependency-free connector, state machine, and HTTP client |
-| <img src="https://cdn.simpleicons.org/docker/2496ED" width="18" alt="Docker"> | Docker Compose | Reproducible Cognee backend and UI |
-| 🧠 | Cognee | `remember`, graph extraction, enrichment, and recall |
-| <img src="https://cdn.simpleicons.org/sqlite/003B57" width="18" alt="SQLite"> | SQLite | Read-only OpenCode source and Cognee metadata |
-| 🕸️ | Kuzu | Embedded knowledge graph |
-| 🧭 | LanceDB | Embedded vector search |
-| <img src="https://cdn.simpleicons.org/openai/412991" width="18" alt="OpenAI-compatible API"> | OpenAI-compatible API | Local chat and embedding model transport |
+Session history is sensitive. Keep the inference server, Cognee API, and UI
+local unless you add authentication, TLS, explicit CORS origins, and firewall
+controls. Regex scrubbing is defense-in-depth, not a complete DLP system.
 
-## Configuration
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `LLM_BASE_URL` | `http://127.0.0.1:8000` | OpenAI-compatible inference server |
-| `LLM_DOCKER_ENDPOINT` | `http://host.docker.internal:8000/v1` | Same server as seen from the Cognee container |
-| `LLM_API_KEY` | — | Server API key (required) |
-| `DISTILL_MODEL` / `--model` | Qwen3.6-35B-A3B (MLX 4-bit) | Distill LLM; any strong instruction model works |
-| `DISABLE_THINKING` | `true` | Send Qwen-compatible hard switch; set false if an endpoint rejects it |
-| `COGNEE_API_URL` | `http://localhost:8010` | Cognee API |
-| `OPENCODE_DB` | `~/.local/share/opencode/opencode.db` | Source DB (read-only access, never written) |
-| `--concurrency` | `4` | Parallel distill workers (match to your GPU headroom) |
-| `--limit` / `--offset` | — | Slice the session list (testing, sharding) |
-
-Server-side model choice lives in `docker-compose.yml` (`LLM_MODEL`,
-`EMBEDDING_MODEL`, `LLM_ARGS`, instructor mode). See the wiki:
-**Configuration** for the full matrix, including the reasoning-model
-thinking-preamble fix.
-
-## Live capture (going forward)
-
-The backfill covers history. For new sessions, install Cognee's OpenCode
-memory plugin so every session is captured, recalled, and bridged into the
-same dataset automatically:
-
-```bash
-# build @cognee/cognee-opencode from
-# https://github.com/topoteretes/cognee-integrations (integrations/opencode)
-```
-
-```json
-{ "plugin": [["file:/path/to/cognee-opencode",
-  { "baseUrl": "http://localhost:8010", "datasetName": "knowledge_base" }]] }
-```
-
-Restart OpenCode after adding it. Details in the wiki: **Live capture**.
-
-## Connectors roadmap
-
-- [x] **OpenCode** (`session`/`message`/`part` SQLite schema) — `backfill.py`
-- [ ] Claude Code (`~/.claude/projects` JSONL)
-- [ ] Cursor / Windsurf transcripts
-- [ ] Continue.dev / Cline exports
-- [ ] Generic JSONL (`--input transcript.jsonl` — bring your own extractor)
-
-Each connector implements: **extract (read-only) → distill → submit**.
-Want to add one? Wiki: **Adding a connector**.
-
-## Troubleshooting (short version)
-
-- **Extraction stuck `pending` / validation errors** → reasoning model emitting
-  chain-of-thought into strict JSON calls. Fix is documented and default-on:
-  `chat_template_kwargs.enable_thinking=false` (connector) + `LLM_ARGS`
-  (server). Wiki: **Thinking-preamble**.
-- **Server LLM timeouts under load** → `COGNEE_SKIP_CONNECTION_TEST=true`
-  is already set; reduce `--concurrency`, close competing sessions.
-- **UI "Cannot connect to backend"** → `CORS_ALLOWED_ORIGINS`/`UI_APP_URL`
-  must match the exact browser origin. Already set for `:3010` in compose.
+Read **[Security and privacy](https://github.com/thomasmaerz/cognee-backfill/wiki/Security-and-privacy)**
+before processing regulated or organization-confidential data.
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Built on [Cognee](https://github.com/topoteretes/cognee) (Apache-2.0).
+MIT. See [LICENSE](LICENSE). Cognee is licensed separately under Apache-2.0.
