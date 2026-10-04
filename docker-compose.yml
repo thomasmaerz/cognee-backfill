@@ -1,0 +1,78 @@
+services:
+  cognee:
+    image: cognee/cognee:main
+    ports:
+      # Host 8010 -> container 8000. Port 8000 on the Mac is oMLX; do not clash.
+      - "8010:8000"
+    environment:
+      # --- LLM via oMLX (OpenAI-compatible, Apple Silicon) ---
+      # Qwen3.6-35B-A3B (3B active params, ~1.45x faster than gemma).
+      # Thinking disabled via LLM_ARGS chat_template_kwargs (verified:
+      # flag -> clean output + zero validation retries; no flag ->
+      # "Thinking Process" preamble -> retry storms -> rollback).
+      LLM_PROVIDER: custom
+      LLM_MODEL: openai/Qwen3.6-35B-A3B-Uncensored-Heretic-MLX-4bit
+      LLM_ENDPOINT: http://host.docker.internal:8000/v1
+      LLM_API_KEY: ${OMLX_API_KEY}
+      LLM_TEMPERATURE: "0.1"
+      # Extra kwargs passed to every LLM call (JSON).
+      LLM_ARGS: '{"chat_template_kwargs": {"enable_thinking": false}}'
+      # tool_call survives chatty local models better than json_mode when
+      # the model prepends thinking preamble to structured output.
+      LLM_INSTRUCTOR_MODE: json_schema_mode
+      # instructor framework honors LLM_INSTRUCTOR_MODE; the default
+      # litellm_native backend ignores it (retries + rollback on schema echo).
+      STRUCTURED_OUTPUT_FRAMEWORK: instructor
+      # Preflight LLM ping times out on a loaded local server and strands
+      # datasets in pending; skip it (docs-recommended for small/local models).
+      COGNEE_SKIP_CONNECTION_TEST: "true"
+      # --- Embeddings via oMLX ---
+      # openai_compatible sends the model id verbatim (no LiteLLM prefix).
+      EMBEDDING_PROVIDER: openai_compatible
+      EMBEDDING_MODEL: jina-embeddings-v5-text-small-retrieval-mlx
+      EMBEDDING_ENDPOINT: http://host.docker.internal:8000/v1
+      EMBEDDING_API_KEY: ${OMLX_API_KEY}
+      EMBEDDING_DIMENSIONS: "1024"
+      EMBEDDING_BATCH_SIZE: "5"
+      # --- Single-user local try-out: no auth, embedded stores (SQLite/LanceDB) ---
+      ENABLE_BACKEND_ACCESS_CONTROL: "false"
+      # UI origin (browser address). Without this the browser blocks API
+      # calls and the UI reports "Cannot connect to local backend".
+      CORS_ALLOWED_ORIGINS: "http://localhost:3010"
+      UI_APP_URL: "http://localhost:3010"
+      # Local-dev login for the UI (same default as upstream compose).
+      # Set once on the passwordless default user; localhost-only posture.
+      DEFAULT_USER_PASSWORD: "default_password"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - cognee_storage:/cognee-storage
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  # Cognee web UI: datasets, graph visualization, sessions.
+  # Browser talks to the backend directly, so the backend URL must be the
+  # host-side address (:8010), not the container-internal one.
+  frontend:
+    image: cognee/cognee-ui:latest
+    ports:
+      - "3010:3000"
+    environment:
+      - COGNEE_BACKEND_URL=http://localhost:8010
+      - DEFAULT_USER_PASSWORD=default_password
+      # Local mode: unlocks datasets/search/graph/sessions UI sections that
+      # otherwise render as "Cognee Cloud feature" badges.
+      - NEXT_PUBLIC_IS_CLOUD_ENVIRONMENT=false
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "2"
+
+volumes:
+  cognee_storage:

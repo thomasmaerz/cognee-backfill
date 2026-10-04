@@ -1,0 +1,9 @@
+.env
+__pycache__/
+.venv/
+*.pyc
+progress.json
+var/
+*.log
+*.pid
+cognee_storage/

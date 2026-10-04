@@ -1,0 +1,457 @@
+#!/usr/bin/env python3
+"""Backfill AI coding-assistant session history into Cognee as distilled knowledge.
+
+Two-phase pipeline (local models only, any OpenAI-compatible server):
+  Phase 1 DISTILL: read sessions from the assistant's store (read-only) ->
+      compact transcript -> local LLM -> small markdown lesson doc. Junk
+      sessions (empty/aborted/trivial) are skipped, never indexed.
+  Phase 2 REMEMBER: POST each distilled doc to the Cognee API dataset,
+      which builds the knowledge graph (entities, relations, vectors).
+
+Connectors: opencode (SQLite) ships first; more ingestion lines planned.
+See README.md and the wiki for setup.
+
+Usage:
+  export LLM_BASE_URL=http://127.0.0.1:8000 LLM_API_KEY=...
+  python3 backfill.py --stats                       # show store counts
+  python3 backfill.py --limit 3 --dataset kb_smoke  # smoke test
+  python3 backfill.py --dataset knowledge_base      # full run (resumable)
+
+Stdlib only. Progress in progress.json, distilled docs in var/distilled/
+(resumable: kill and re-run any time with zero loss).
+"""
+import argparse
+import concurrent.futures as cf
+import datetime
+import json
+import os
+import re
+import sqlite3
+import sys
+import time
+import urllib.request
+import urllib.error
+
+# Any OpenAI-compatible inference server (oMLX, Ollama, LM Studio, vLLM).
+# OMLX_* names kept as fallback for existing setups.
+LLM_URL = os.environ.get("LLM_BASE_URL",
+                         os.environ.get("OMLX_URL", "http://127.0.0.1:8000"))
+LLM_KEY = os.environ.get("LLM_API_KEY", os.environ.get("OMLX_API_KEY", ""))
+COGNEE_URL = os.environ.get("COGNEE_API_URL", "http://localhost:8010")
+DB_PATH = os.path.expanduser(
+    os.environ.get("OPENCODE_DB", "~/.local/share/opencode/opencode.db"))
+PROGRESS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "progress.json")
+# Distilled docs persisted per session: resume-safe (progress.json alone
+# cannot rebuild them) and auditable. Gitignored: may contain project facts.
+DOCS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "var", "distilled")
+
+DISTILL_MODEL = os.environ.get(
+    "DISTILL_MODEL",
+    "Qwen3.6-35B-A3B-Uncensored-Heretic-MLX-4bit")  # override with --model
+MAX_TRANSCRIPT_CHARS = 18000  # head+tail sampled: outcomes live at the end
+HEAD_CHARS = 6000
+MAX_TOOL_OUTPUT = 1500
+MAX_TEXT_PART = 4000
+
+DISTILL_SYSTEM = """You distill an AI coding-assistant session into a durable knowledge note.
+Keep ONLY: decisions made and why, reusable patterns/workflows, gotchas and fixes,
+error causes and solutions, project facts (paths, commands, config), file symbols discussed.
+Drop: greetings, aborted attempts with no lesson, raw log dumps, thinking-out-loud with no conclusion.
+Be concrete: keep exact file paths, symbol names, commands, error strings.
+Output markdown with exactly these sections (omit empty ones):
+# <short title>
+## Summary (2-4 sentences)
+## Decisions
+## Patterns & Gotchas
+## Errors & Fixes
+## Files & Symbols
+## Project Context
+If the session contains nothing worth remembering, output exactly: JUNK
+Output ONLY the note (or JUNK). No preamble, no thinking process, no analysis steps."""
+
+SECRET_PATTERNS = [
+    (re.compile(r"sk-[A-Za-z0-9-_]{10,}"), "[REDACTED_API_KEY]"),
+    (re.compile(r"ghp_[A-Za-z0-9]{10,}"), "[REDACTED]"),
+    (re.compile(r"xox[bcpas]-[A-Za-z0-9-]+"), "[REDACTED]"),
+    (re.compile(r"AKIA[0-9A-Z]{16}"), "[REDACTED]"),
+    (re.compile(r"(?i)(password|passwd|secret|api[_-]?key|token)\s*[:=]\s*\S+"),
+     r"\1=[REDACTED]"),
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"), "[REDACTED_KEY]"),
+    (re.compile(r"Bearer\s+[A-Za-z0-9\-._~+/]+=*", re.I), "Bearer [REDACTED]"),
+]
+
+
+def scrub(text):
+    for pat, repl in SECRET_PATTERNS:
+        text = pat.sub(repl, text)
+    return text
+
+
+def db():
+    con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def session_list(limit=None, offset=0):
+    con = db()
+    q = ("SELECT s.id, s.title, s.directory, s.time_created, "
+         "COUNT(DISTINCT m.id) AS n_messages "
+         "FROM session s LEFT JOIN message m ON m.session_id = s.id "
+         "GROUP BY s.id ORDER BY s.time_created DESC")
+    if limit is not None:
+        q += f" LIMIT {int(limit)} OFFSET {int(offset)}"
+    rows = [dict(r) for r in con.execute(q)]
+    con.close()
+    return rows
+
+
+def build_transcript(session_id):
+    """Compact, junk-reduced transcript from the part table."""
+    con = db()
+    parts = list(con.execute(
+        "SELECT m.time_created AS t, p.data AS d FROM part p "
+        "JOIN message m ON m.id = p.message_id "
+        "WHERE p.session_id = ? ORDER BY m.time_created, p.time_created",
+        (session_id,)))
+    con.close()
+    out, substantive = [], 0
+    for row in parts:
+        try:
+            d = json.loads(row["d"])
+        except Exception:
+            continue
+        t = d.get("type", "")
+        if t in ("step-start", "step-finish"):
+            continue
+        if t == "text":
+            txt = (d.get("text") or "")[:MAX_TEXT_PART].strip()
+            if len(txt) > 40:
+                substantive += 1
+            out.append(f"[assistant] {txt}" if txt else "")
+        elif t == "reasoning":
+            txt = (d.get("text") or "")[:500].strip()
+            if txt:
+                out.append(f"[thinking] {txt}")
+        elif t == "tool":
+            tool = d.get("tool", "?")
+            st = d.get("state", {}) or {}
+            inp = json.dumps(st.get("input", ""))[:400]
+            output = (st.get("output") or st.get("metadata", {}).get("output")
+                      or "")[:MAX_TOOL_OUTPUT]
+            out.append(f"[tool:{tool} in={inp} out={output}]".strip())
+        elif t in ("user",):
+            txt = (d.get("text") or "")[:MAX_TEXT_PART].strip()
+            if txt:
+                substantive += 1
+                out.append(f"[user] {txt}")
+    # user turns live in message.data for role=user; merge them in order
+    con = db()
+    try:
+        for r in con.execute(
+                "SELECT time_created, data FROM message WHERE session_id = ? "
+                "ORDER BY time_created", (session_id,)):
+            try:
+                md = json.loads(r["data"])
+            except Exception:
+                continue
+            if md.get("role") == "user":
+                # user text is in part rows already if present; count only
+                pass
+    finally:
+        con.close()
+    text = scrub("\n".join(x for x in out if x))
+    if len(text) > MAX_TRANSCRIPT_CHARS:
+        # head+tail: setup at the start, decisions/outcome at the end
+        text = (text[:HEAD_CHARS] + "\n[... middle truncated ...]\n"
+                + text[-(MAX_TRANSCRIPT_CHARS - HEAD_CHARS):])
+    return text, substantive
+
+
+def llm_chat(system, user, model=None, max_tokens=1200, timeout=180):
+    model = model or DISTILL_MODEL
+    body = json.dumps({
+        "model": model,
+        "messages": [{"role": "system", "content": system},
+                     {"role": "user", "content": user}],
+        "max_tokens": max_tokens, "temperature": 0.1,
+        # Hard-disable Qwen-style thinking at the template level.
+        # Harmless for models without thinking mode; without it, reasoning
+        # models prepend chain-of-thought that breaks strict JSON parsing.
+        # See wiki: Troubleshooting > Thinking-preamble.
+        "chat_template_kwargs": {"enable_thinking": False},
+    }).encode()
+    req = urllib.request.Request(
+        f"{LLM_URL}/v1/chat/completions", data=body,
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {LLM_KEY}"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.load(r)["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        return f"__ERROR__ {e}"
+
+
+def distill(session):
+    sid = session["id"]
+    transcript, substantive = build_transcript(sid)
+    if substantive < 2 or len(transcript) < 300:
+        return None, "junk: too little substance"
+    header = (f"Session: {session.get('title', '?')} "
+              f"[{session.get('directory', '?')}] "
+              f"{datetime.datetime.fromtimestamp(session['time_created']/1000).date()}\n\n")
+    doc = llm_chat(DISTILL_SYSTEM, header + transcript)
+    if doc.startswith("__ERROR__"):
+        return None, f"distill-error: {doc}"
+    if doc.strip() == "JUNK" or len(doc) < 200:
+        return None, "junk: model judged no durable content"
+    return scrub(doc), None
+
+
+def cognee_post(path, fields, files=None, timeout=600):
+    """Multipart POST to Cognee API (stdlib). fields: {k: str|list}."""
+    boundary = "----backfill%d" % int(time.time() * 1000)
+    buf = b""
+    for k, v in fields.items():
+        vals = v if isinstance(v, list) else [v]
+        for item in vals:
+            buf += (f"--{boundary}\r\nContent-Disposition: form-data; "
+                    f"name=\"{k}\"\r\n\r\n{item}\r\n").encode()
+    body = buf + f"--{boundary}--\r\n".encode()
+    req = urllib.request.Request(
+        f"{COGNEE_URL}{path}", data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.load(r), None
+    except urllib.error.HTTPError as e:
+        return None, f"http {e.code}: {e.read()[:300]}"
+    except Exception as e:
+        return None, str(e)[:200]
+
+
+def cognee_get(path, timeout=30):
+    try:
+        with urllib.request.urlopen(f"{COGNEE_URL}{path}",
+                                    timeout=timeout) as r:
+            return json.load(r), None
+    except Exception as e:
+        return None, str(e)[:200]
+
+
+def cognee_delete(path, timeout=60):
+    req = urllib.request.Request(f"{COGNEE_URL}{path}", method="DELETE")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return (r.read()[:300].decode(errors="replace"), None)
+    except urllib.error.HTTPError as e:
+        return None, f"http {e.code}: {e.read()[:300]}"
+    except Exception as e:
+        return None, str(e)[:200]
+
+
+def load_progress():
+    if os.path.exists(PROGRESS_FILE):
+        return json.load(open(PROGRESS_FILE))
+    return {}
+
+
+def dataset_id(name):
+    data, err = cognee_get("/api/v1/datasets")
+    if err:
+        return None
+    for d in data:
+        if d.get("name") == name:
+            return d.get("id")
+    return None
+
+
+def wait_for_processing(dataset, timeout_s=6 * 3600):
+    did = dataset_id(dataset)
+    if not did:
+        print("  dataset not found (nothing submitted?)")
+        return
+    t0 = time.time()
+    while time.time() - t0 < timeout_s:
+        st, err = cognee_get(f"/api/v1/datasets/{did}/processing-status")
+        if err:
+            print(f"  status err: {err}; retrying")
+        else:
+            print(f"  extraction: {st.get('completed')}/{st.get('total')} "
+                  f"done ({time.time()-t0:.0f}s elapsed)", flush=True)
+            items = st.get("items", []) or []
+            if st.get("total", 0) > 0 and all(
+                    x.get("completed") for x in items):
+                print("  extraction complete")
+                return
+        time.sleep(60)
+    print("  TIMEOUT waiting for extraction; re-run to resume polling")
+
+
+def save_progress(p):
+    json.dump(p, open(PROGRESS_FILE, "w"), indent=1)
+
+
+def doc_path(sid):
+    return os.path.join(DOCS_DIR, f"{sid}.md")
+
+
+def load_doc(sid):
+    p = doc_path(sid)
+    if os.path.exists(p):
+        return open(p).read()
+    return None
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Backfill OpenCode -> Cognee")
+    ap.add_argument("--stats", action="store_true")
+    ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--offset", type=int, default=0)
+    ap.add_argument("--dataset", default="opencode_kb")
+    ap.add_argument("--concurrency", type=int, default=4)
+    ap.add_argument("--model", default=None,
+                    help="distill LLM model id (default: $DISTILL_MODEL)")
+    ap.add_argument("--distill-only", action="store_true",
+                    help="phase 1 only, print docs, do not POST to Cognee")
+    ap.add_argument("--improve", action="store_true",
+                    help="run improve() on dataset after remembering")
+    ap.add_argument("--recall", nargs="*", default=None,
+                    help="spot-check queries after run")
+    args = ap.parse_args()
+    global DISTILL_MODEL
+    if args.model:
+        DISTILL_MODEL = args.model
+    print(f"distill model: {DISTILL_MODEL}")
+
+    if args.stats:
+        con = db()
+        for t in ("session", "message", "part"):
+            print(t, con.execute(f'SELECT COUNT(*) FROM "{t}"').fetchone()[0])
+        con.close()
+        return
+
+    sessions = session_list(args.limit, args.offset)
+    print(f"{len(sessions)} sessions to process -> dataset '{args.dataset}'")
+    if args.distill_only:
+        # dry run: never touch progress.json or the backend
+        with cf.ThreadPoolExecutor(max_workers=args.concurrency) as ex:
+            futs = {ex.submit(distill, s): s for s in sessions}
+            for fut in cf.as_completed(futs):
+                s = futs[fut]
+                doc, reason = fut.result()
+                print("=" * 40, s["id"], s.get("title"))
+                print((doc[:1500] if doc else f"SKIP: {reason}"))
+        return
+    progress = load_progress()
+    os.makedirs(DOCS_DIR, exist_ok=True)
+    by_id = {s["id"]: s for s in sessions}
+    # Resume-safe todo: fresh, errored, or distilled-but-doc-missing
+    # (pre-persistence runs). Skipped (junk) and remembered are final.
+    def needs_distill(sid):
+        st = progress.get(sid, {}).get("status")
+        if st in ("skipped", "remembered", "remember-failed"):
+            return st == "remember-failed"  # retry failed submits
+        if st == "distilled" and load_doc(sid):
+            return False
+        return True
+    todo = [s for s in sessions if needs_distill(s["id"])]
+    print(f"{len(todo)} remaining after progress.json")
+    if not todo and not any(
+            progress.get(sid, {}).get("status") in ("distilled",
+                                                    "remember-failed")
+            for sid in by_id):
+        print("nothing to do")
+    else:
+        # Phase 1: distill (parallel, oMLX allows 8 concurrent; use 4)
+        docs = {}
+        t0 = time.time()
+        with cf.ThreadPoolExecutor(max_workers=args.concurrency) as ex:
+            futs = {ex.submit(distill, s): s for s in todo}
+            for i, fut in enumerate(cf.as_completed(futs), 1):
+                s = futs[fut]
+                doc, reason = fut.result()
+                if doc:
+                    docs[s["id"]] = (s, doc)
+                    open(doc_path(s["id"]), "w").write(doc)
+                    progress[s["id"]] = {"status": "distilled",
+                                         "title": s.get("title")}
+                elif reason and reason.startswith("junk"):
+                    progress[s["id"]] = {"status": "skipped", "reason": reason}
+                else:
+                    progress[s["id"]] = {"status": "error", "reason": reason}
+                if i % 10 == 0:
+                    save_progress(progress)
+                    dt = time.time() - t0
+                    print(f"  distilled {i}/{len(todo)} "
+                          f"({len(docs)} kept) {dt:.0f}s", flush=True)
+        save_progress(progress)
+        dt = time.time() - t0
+        print(f"Phase 1 done: {len(docs)} kept, "
+              f"{len(todo)-len(docs)} skipped, {dt:.0f}s "
+              f"({dt/max(len(todo),1):.1f}s/session)")
+
+        # Phase 2: remember in background (server keeps working across
+        # client timeouts) then poll until extraction completes.
+        # Merge in docs persisted by earlier runs so a resume submits
+        # everything distilled-but-not-remembered, not just this run's.
+        for sid, entry in progress.items():
+            if (entry.get("status") in ("distilled", "remember-failed")
+                    and sid not in docs and sid in by_id):
+                d = load_doc(sid)
+                if d:
+                    docs[sid] = (by_id[sid], d)
+        print(f"Phase 2: {len(docs)} docs to submit")
+        t0 = time.time()
+        for i, (sid, (s, doc)) in enumerate(docs.items(), 1):
+            meta = json.dumps([{"session_id": sid, "title": s.get("title"),
+                                "directory": s.get("directory"),
+                                "source": "opencode-backfill"}])
+            res, err = cognee_post("/api/v1/remember",
+                                   {"raw_data": [doc],
+                                    "datasetName": args.dataset,
+                                    "external_metadata": meta,
+                                    "run_in_background": "true",
+                                    "self_improvement": "false"})
+            if err:
+                progress[sid] = {"status": "remember-failed",
+                                 "title": s.get("title"), "error": err}
+            else:
+                progress[sid] = {"status": "remembered",
+                                 "title": s.get("title")}
+            if i % 25 == 0:
+                save_progress(progress)
+                print(f"  submitted {i}/{len(docs)}", flush=True)
+        save_progress(progress)
+        print(f"Phase 2 submit done in {time.time()-t0:.0f}s; "
+              f"waiting for server extraction ...")
+        wait_for_processing(args.dataset, timeout_s=6 * 3600)
+
+    if args.improve:
+        print("running improve() ...")
+        res, err = cognee_post("/api/v1/improve",
+                               {"datasetName": args.dataset}, timeout=1800)
+        print("improve:", err or str(res)[:500])
+
+    if args.recall is not None:
+        queries = args.recall or ["What decisions were made?",
+                                  "What gotchas came up?"]
+        for q in queries:
+            body = json.dumps({"query": q, "datasets": [args.dataset]}).encode()
+            req = urllib.request.Request(
+                f"{COGNEE_URL}/api/v1/recall", data=body,
+                headers={"Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(req, timeout=300) as r:
+                    ans = json.load(r)
+                txt = (ans[0].get("text") if isinstance(ans, list) and ans
+                       else str(ans))[:800]
+                print(f"\nQ: {q}\nA: {txt}")
+            except Exception as e:
+                print(f"\nQ: {q}\nERR: {e}")
+
+
+if __name__ == "__main__":
+    sys.exit(main())
