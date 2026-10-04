@@ -5,7 +5,7 @@
 ### Agent memory systems start empty. This gives them a past.
 
 Backfill years of coding-assistant history into durable, local-first memory.<br>
-Keep the decisions, fixes, workflows, and gotchas. Leave the junk behind.
+Keep the projects, tasks, investigations, decisions, fixes, workflows, and gotchas. Leave the junk behind.
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)](https://www.docker.com/)
@@ -170,6 +170,13 @@ echo $! > monitor.pid
 Stop and restart the same command at any time. Accepted notes are persisted to
 `var/distilled/<session-id>.md`; `progress.json` records pipeline state.
 
+Every skipped source ID remains in `progress.json` and in the review-friendly
+`var/skipped.json` manifest. Re-evaluate them later with:
+
+```bash
+python3 backfill.py --dataset knowledge_base --reparse-skipped
+```
+
 ### 5. Enrich and verify
 
 After Cognee reports that all documents completed processing:
@@ -192,7 +199,7 @@ for monitoring, backups, cleanup, and verification criteria.
 |---|---|
 | Source isolation | SQLite is opened with `mode=ro`; connectors never mutate history |
 | Resume safety | Notes reach disk before their state becomes `distilled` |
-| Explicit junk filtering | Only an exact model response of `JUNK` is discarded |
+| Conservative junk filtering | Work history is retained even without a decision; only empty handshakes, pings, and sessions with no meaningful activity are discarded |
 | Retryable failures | Distillation and submission errors remain eligible for retry |
 | Secret defense-in-depth | Common keys, tokens, passwords, and private-key markers are redacted |
 | Local-first execution | LLM, embeddings, graph, vectors, and metadata can stay on one machine |
@@ -233,6 +240,8 @@ before changing model families.
 | `OPENCODE_DB` | `~/.local/share/opencode/opencode.db` | Read-only OpenCode source |
 | `--concurrency` | `4` | Parallel distillation workers |
 | `--limit`, `--offset` | unset | Smoke testing and manual sharding |
+| `--reparse-skipped` | off | Re-evaluate every session currently classified as junk |
+| `--reparse-all` | off | Re-distill all non-remembered sessions |
 
 The complete model, embedding, and structured-output matrix lives in
 **[Configuration](https://github.com/thomasmaerz/cognee-backfill/wiki/Configuration)**.
