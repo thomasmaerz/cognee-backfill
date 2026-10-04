@@ -67,6 +67,28 @@ python3 backfill.py --dataset knowledge_base --improve --recall "your test quest
 Browse the graph at `http://localhost:3010` (sign in with the local-dev
 `default_user@example.com` / `default_password` — localhost only).
 
+## Documentation
+
+- [Architecture](https://github.com/thomasmaerz/cognee-backfill/wiki/Architecture) — stages, state machine, storage, and failure boundaries
+- [Configuration](https://github.com/thomasmaerz/cognee-backfill/wiki/Configuration) — models, embeddings, ports, and concurrency
+- [Operations](https://github.com/thomasmaerz/cognee-backfill/wiki/Operations) — test, launch, monitor, pause, resume, back up, and clean up
+- [OpenCode connector](https://github.com/thomasmaerz/cognee-backfill/wiki/OpenCode-connector) — source schema and transcript reconstruction
+- [Adding a connector](https://github.com/thomasmaerz/cognee-backfill/wiki/Adding-a-connector) — contract for upcoming ingestion lines
+- [Thinking-preamble](https://github.com/thomasmaerz/cognee-backfill/wiki/Thinking-preamble) — reliable Qwen/reasoning-model structured output
+- [Security and privacy](https://github.com/thomasmaerz/cognee-backfill/wiki/Security-and-privacy) — source isolation, scrubbing, and retention
+
+## Stack
+
+| | Component | Role |
+|---|---|---|
+| <img src="https://cdn.simpleicons.org/python/3776AB" width="18" alt="Python"> | Python 3.10+ | Dependency-free connector, state machine, and HTTP client |
+| <img src="https://cdn.simpleicons.org/docker/2496ED" width="18" alt="Docker"> | Docker Compose | Reproducible Cognee backend and UI |
+| 🧠 | Cognee | `remember`, graph extraction, enrichment, and recall |
+| <img src="https://cdn.simpleicons.org/sqlite/003B57" width="18" alt="SQLite"> | SQLite | Read-only OpenCode source and Cognee metadata |
+| 🕸️ | Kuzu | Embedded knowledge graph |
+| 🧭 | LanceDB | Embedded vector search |
+| <img src="https://cdn.simpleicons.org/openai/412991" width="18" alt="OpenAI-compatible API"> | OpenAI-compatible API | Local chat and embedding model transport |
+
 ## Configuration
 
 | Variable | Default | Purpose |
@@ -74,6 +96,7 @@ Browse the graph at `http://localhost:3010` (sign in with the local-dev
 | `LLM_BASE_URL` | `http://127.0.0.1:8000` | OpenAI-compatible inference server |
 | `LLM_API_KEY` | — | Server API key (required) |
 | `DISTILL_MODEL` / `--model` | Qwen3.6-35B-A3B (MLX 4-bit) | Distill LLM; any strong instruction model works |
+| `DISABLE_THINKING` | `true` | Send Qwen-compatible hard switch; set false if an endpoint rejects it |
 | `COGNEE_API_URL` | `http://localhost:8010` | Cognee API |
 | `OPENCODE_DB` | `~/.local/share/opencode/opencode.db` | Source DB (read-only access, never written) |
 | `--concurrency` | `4` | Parallel distill workers (match to your GPU headroom) |

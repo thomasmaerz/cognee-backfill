@@ -50,6 +50,8 @@ DOCS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 DISTILL_MODEL = os.environ.get(
     "DISTILL_MODEL",
     "Qwen3.6-35B-A3B-Uncensored-Heretic-MLX-4bit")  # override with --model
+DISABLE_THINKING = os.environ.get("DISABLE_THINKING", "true").lower() not in (
+    "0", "false", "no", "off")
 MAX_TRANSCRIPT_CHARS = 18000  # head+tail sampled: outcomes live at the end
 HEAD_CHARS = 6000
 MAX_TOOL_OUTPUT = 1500
@@ -112,7 +114,7 @@ def build_transcript(session_id):
     """Compact, junk-reduced transcript from the part table."""
     con = db()
     parts = list(con.execute(
-        "SELECT m.time_created AS t, p.data AS d FROM part p "
+        "SELECT m.time_created AS t, m.data AS md, p.data AS d FROM part p "
         "JOIN message m ON m.id = p.message_id "
         "WHERE p.session_id = ? ORDER BY m.time_created, p.time_created",
         (session_id,)))
@@ -121,8 +123,10 @@ def build_transcript(session_id):
     for row in parts:
         try:
             d = json.loads(row["d"])
+            md = json.loads(row["md"])
         except Exception:
             continue
+        role = md.get("role", "assistant")
         t = d.get("type", "")
         if t in ("step-start", "step-finish"):
             continue
@@ -130,7 +134,7 @@ def build_transcript(session_id):
             txt = (d.get("text") or "")[:MAX_TEXT_PART].strip()
             if len(txt) > 40:
                 substantive += 1
-            out.append(f"[assistant] {txt}" if txt else "")
+            out.append(f"[{role}] {txt}" if txt else "")
         elif t == "reasoning":
             txt = (d.get("text") or "")[:500].strip()
             if txt:
@@ -142,26 +146,6 @@ def build_transcript(session_id):
             output = (st.get("output") or st.get("metadata", {}).get("output")
                       or "")[:MAX_TOOL_OUTPUT]
             out.append(f"[tool:{tool} in={inp} out={output}]".strip())
-        elif t in ("user",):
-            txt = (d.get("text") or "")[:MAX_TEXT_PART].strip()
-            if txt:
-                substantive += 1
-                out.append(f"[user] {txt}")
-    # user turns live in message.data for role=user; merge them in order
-    con = db()
-    try:
-        for r in con.execute(
-                "SELECT time_created, data FROM message WHERE session_id = ? "
-                "ORDER BY time_created", (session_id,)):
-            try:
-                md = json.loads(r["data"])
-            except Exception:
-                continue
-            if md.get("role") == "user":
-                # user text is in part rows already if present; count only
-                pass
-    finally:
-        con.close()
     text = scrub("\n".join(x for x in out if x))
     if len(text) > MAX_TRANSCRIPT_CHARS:
         # head+tail: setup at the start, decisions/outcome at the end
@@ -172,17 +156,17 @@ def build_transcript(session_id):
 
 def llm_chat(system, user, model=None, max_tokens=1200, timeout=180):
     model = model or DISTILL_MODEL
-    body = json.dumps({
+    payload = {
         "model": model,
         "messages": [{"role": "system", "content": system},
                      {"role": "user", "content": user}],
         "max_tokens": max_tokens, "temperature": 0.1,
-        # Hard-disable Qwen-style thinking at the template level.
-        # Harmless for models without thinking mode; without it, reasoning
-        # models prepend chain-of-thought that breaks strict JSON parsing.
-        # See wiki: Troubleshooting > Thinking-preamble.
-        "chat_template_kwargs": {"enable_thinking": False},
-    }).encode()
+    }
+    if DISABLE_THINKING:
+        # Hard-disable Qwen-style thinking at the template level. Set
+        # DISABLE_THINKING=false if an endpoint rejects provider extensions.
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
+    body = json.dumps(payload).encode()
     req = urllib.request.Request(
         f"{LLM_URL}/v1/chat/completions", data=body,
         headers={"Content-Type": "application/json",

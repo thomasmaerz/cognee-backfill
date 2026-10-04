@@ -11,9 +11,9 @@ services:
       # flag -> clean output + zero validation retries; no flag ->
       # "Thinking Process" preamble -> retry storms -> rollback).
       LLM_PROVIDER: custom
-      LLM_MODEL: openai/Qwen3.6-35B-A3B-Uncensored-Heretic-MLX-4bit
+      LLM_MODEL: ${COGNEE_LLM_MODEL:-openai/Qwen3.6-35B-A3B-Uncensored-Heretic-MLX-4bit}
       LLM_ENDPOINT: http://host.docker.internal:8000/v1
-      LLM_API_KEY: ${OMLX_API_KEY}
+      LLM_API_KEY: ${LLM_API_KEY:?set LLM_API_KEY in .env}
       LLM_TEMPERATURE: "0.1"
       # Extra kwargs passed to every LLM call (JSON).
       LLM_ARGS: '{"chat_template_kwargs": {"enable_thinking": false}}'
@@ -29,10 +29,10 @@ services:
       # --- Embeddings via oMLX ---
       # openai_compatible sends the model id verbatim (no LiteLLM prefix).
       EMBEDDING_PROVIDER: openai_compatible
-      EMBEDDING_MODEL: jina-embeddings-v5-text-small-retrieval-mlx
+      EMBEDDING_MODEL: ${COGNEE_EMBEDDING_MODEL:-jina-embeddings-v5-text-small-retrieval-mlx}
       EMBEDDING_ENDPOINT: http://host.docker.internal:8000/v1
-      EMBEDDING_API_KEY: ${OMLX_API_KEY}
-      EMBEDDING_DIMENSIONS: "1024"
+      EMBEDDING_API_KEY: ${LLM_API_KEY}
+      EMBEDDING_DIMENSIONS: ${COGNEE_EMBEDDING_DIMENSIONS:-1024}
       EMBEDDING_BATCH_SIZE: "5"
       # --- Single-user local try-out: no auth, embedded stores (SQLite/LanceDB) ---
       ENABLE_BACKEND_ACCESS_CONTROL: "false"
