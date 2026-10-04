@@ -2,15 +2,15 @@
 
 # cognee-backfill
 
-### Distill years of AI coding history into durable, local-first memory.
+### Agent memory systems start empty. This gives them a past.
 
-Extract the decisions, fixes, workflows, and gotchas worth keeping.<br>
-Skip the chatter, aborted attempts, reasoning traces, and raw log noise.
+Backfill years of coding-assistant history into durable, local-first memory.<br>
+Keep the decisions, fixes, workflows, and gotchas. Leave the junk behind.
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)](https://www.docker.com/)
 [![Cognee](https://img.shields.io/badge/Memory-Cognee-7C3AED)](https://github.com/topoteretes/cognee)
-[![Local models](https://img.shields.io/badge/Models-Local_First-10A37F?logo=openai&logoColor=white)](#local-models)
+[![Local models](https://img.shields.io/badge/Models-Local_First-6BA539?logo=openapiinitiative&logoColor=white)](#local-models)
 [![License](https://img.shields.io/badge/License-MIT-2EA44F)](LICENSE)
 
 **[Quick start](#quick-start)** · **[How it works](#how-it-works)** · **[Technical wiki](https://github.com/thomasmaerz/cognee-backfill/wiki)** · **[Connector roadmap](#connector-roadmap)**
@@ -19,11 +19,33 @@ Skip the chatter, aborted attempts, reasoning traces, and raw log noise.
 
 ---
 
-`cognee-backfill` converts coding-assistant session history into a compact
-[Cognee](https://github.com/topoteretes/cognee) knowledge graph. It does not
-blindly embed every message. Each session is first distilled by a local LLM;
-only durable knowledge is passed to Cognee for graph extraction, embeddings,
-and recall.
+## The missing half of agent memory
+
+Agent-memory systems are built to remember **what happens next**. Mainstream
+tools capture new conversations after installation, but do not ship a practical
+end-to-end mechanism for backfilling years of existing coding-assistant
+history. Your new memory layer starts empty while the decisions and fixes that
+matter remain trapped in old session databases.
+
+`cognee-backfill` fills that gap. It converts existing assistant history into
+a compact [Cognee](https://github.com/topoteretes/cognee) knowledge graph,
+without blindly embedding every message.
+
+### Local first because session history is sensitive
+
+Coding sessions routinely contain source code, filesystem paths, internal
+URLs, shell output, credentials, customer context, and unfinished ideas.
+Shipping a multi-gigabyte history through hosted AI APIs sends all of that into
+big-tech infrastructure with retention, logging, and downstream data practices
+you may not control.
+
+This pipeline keeps the source database, distillation model, embedding model,
+graph, vectors, and metadata on your machine by default. **Your history does
+not leave the machine unless you deliberately point the configuration at a
+remote endpoint.**
+
+Each session is distilled locally; only durable knowledge is passed to Cognee
+for graph extraction, embeddings, and recall.
 
 > **Current connector:** OpenCode SQLite history. The pipeline is designed for
 > additional connectors, including Claude Code, Cursor, Cline, and generic
@@ -32,24 +54,28 @@ and recall.
 ## How it works
 
 ```mermaid
-flowchart LR
-    source[(Assistant<br/>history)]
-
-    subgraph distill[Phase 1 - Distill]
+flowchart TB
+    subgraph prepare[1. Private source preparation]
         direction LR
+        source[(Assistant<br/>history)]
         extract[Read-only<br/>connector]
         scrub[Normalize, bound<br/>and scrub secrets]
+        source --> extract --> scrub
+    end
+
+    subgraph distill[2. Distill and checkpoint]
+        direction LR
         llm[Local LLM<br/>distillation]
         gate{Worth<br/>keeping?}
         notes[(Persisted<br/>Markdown notes)]
         junk[Junk skipped]
 
-        extract --> scrub --> llm --> gate
+        llm --> gate
         gate -->|Yes| notes
         gate -->|No| junk
     end
 
-    subgraph remember[Phase 2 - Remember]
+    subgraph remember[3. Build durable local memory]
         direction LR
         ingest[Cognee<br/>remember]
         entities[Entities and<br/>relationships]
@@ -61,7 +87,7 @@ flowchart LR
 
     recall[Graph and<br/>hybrid recall]
 
-    source --> extract
+    scrub --> llm
     notes --> ingest
     stores --> recall
 ```
@@ -221,7 +247,7 @@ The complete model, embedding, and structured-output matrix lives in
 | <img src="https://cdn.simpleicons.org/sqlite/003B57" width="20" alt="SQLite"> | **SQLite** | OpenCode history and Cognee relational metadata |
 | 🕸️ | **Kuzu** | Embedded knowledge graph |
 | 🧭 | **LanceDB** | Embedded vector index |
-| <img src="https://cdn.simpleicons.org/openai/412991" width="20" alt="OpenAI-compatible API"> | **OpenAI-compatible API** | Local model transport for chat and embeddings |
+| <img src="https://cdn.simpleicons.org/openapiinitiative/6BA539" width="20" alt="OpenAI-compatible API"> | **OpenAI-compatible API** | Local model transport for chat and embeddings |
 
 ## Connector roadmap
 
