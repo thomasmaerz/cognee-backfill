@@ -94,6 +94,7 @@ Browse the graph at `http://localhost:3010` (sign in with the local-dev
 | Variable | Default | Purpose |
 |---|---|---|
 | `LLM_BASE_URL` | `http://127.0.0.1:8000` | OpenAI-compatible inference server |
+| `LLM_DOCKER_ENDPOINT` | `http://host.docker.internal:8000/v1` | Same server as seen from the Cognee container |
 | `LLM_API_KEY` | — | Server API key (required) |
 | `DISTILL_MODEL` / `--model` | Qwen3.6-35B-A3B (MLX 4-bit) | Distill LLM; any strong instruction model works |
 | `DISABLE_THINKING` | `true` | Send Qwen-compatible hard switch; set false if an endpoint rejects it |
