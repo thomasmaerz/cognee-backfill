@@ -52,11 +52,11 @@ flowchart LR
     subgraph remember[Phase 2 - Remember]
         direction LR
         ingest[Cognee<br/>remember]
-        graph[Entities and<br/>relationships]
+        entities[Entities and<br/>relationships]
         vectors[Local<br/>embeddings]
         stores[(Kuzu + LanceDB<br/>+ SQLite)]
 
-        ingest --> graph --> vectors --> stores
+        ingest --> entities --> vectors --> stores
     end
 
     recall[Graph and<br/>hybrid recall]
