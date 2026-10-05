@@ -48,7 +48,6 @@ EOF
 launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
 launchctl enable "gui/$(id -u)/$LABEL"
-launchctl kickstart -k "gui/$(id -u)/$LABEL"
 
 echo "Installed and started $LABEL"
 echo "Status: launchctl print gui/$(id -u)/$LABEL"
