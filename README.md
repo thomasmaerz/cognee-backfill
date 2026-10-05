@@ -77,12 +77,13 @@ flowchart TB
 
     subgraph remember[3. Build durable local memory]
         direction LR
-        ingest[Cognee<br/>remember]
+        ingest[Idempotent<br/>batched add]
+        cognify[One bounded<br/>Cognify run]
         entities[Entities and<br/>relationships]
         vectors[Local<br/>embeddings]
         stores[(Kuzu + LanceDB<br/>+ SQLite)]
 
-        ingest --> entities --> vectors --> stores
+        ingest --> cognify --> entities --> vectors --> stores
     end
 
     recall[Graph and<br/>hybrid recall]
@@ -94,12 +95,24 @@ flowchart TB
 
 ### Why distill first?
 
+Cognee preserves chunks and extracts a graph, but extraction is chunk-local. A
+coding session often spreads its outcome across user prompts, tool calls,
+failures, retries, and a final response. Distillation creates one coherent
+session-level document before graph extraction.
+
+An end-to-end comparison on four representative sessions found that direct
+conversation ingestion was 3.2x slower and answered only 3 of 8 factual checks
+fully correctly; distilled notes answered all 8. Preserving tool activity made
+direct ingestion roughly 38x slower. The normalized model input is therefore
+retained in `var/transcripts/` for audit, while the compact note is indexed.
+
 | Naive transcript indexing | `cognee-backfill` |
 |---|---|
 | Embeds greetings, false starts, and log dumps | Keeps decisions, fixes, patterns, and project context |
 | Lets tool output dominate retrieval | Bounds every field and samples long sessions intelligently |
 | Stores raw reasoning traces | Produces concise, structured knowledge notes |
-| Reprocesses everything after interruption | Persists notes and progress for lossless resume |
+| Reprocesses everything after interruption | Persists model inputs and notes for lossless resume |
+| Launches one graph job per document | Adds in idempotent batches, then runs one bounded Cognify job |
 | Risks sending secrets downstream | Scrubs common credentials before the LLM boundary |
 
 ## Quick start
@@ -153,22 +166,34 @@ python3 backfill.py \
   --recall "What durable decisions appear in these sessions?"
 ```
 
-Review the generated notes in `var/distilled/` and delete the smoke dataset
-before starting the complete run.
+Review `var/transcripts/` and `var/distilled/`, then delete the smoke dataset
+before starting the complete run. Cognee content hashes make later re-adds
+idempotent; local distillation state is not tied to one dataset.
 
 ### 4. Run the resumable backfill
 
-```bash
-nohup python3 backfill.py --dataset knowledge_base \
-  > backfill.log 2>&1 < /dev/null &
-echo $! > backfill.pid
+On macOS, install it as a launchd user service. The service starts Cognee,
+resumes from persisted artifacts, restarts after failures, and exits permanently
+after a successful backfill:
 
-nohup ./monitor.sh >/dev/null 2>&1 < /dev/null &
-echo $! > monitor.pid
+```bash
+chmod +x service/*.sh
+./service/install-launchd.sh
+
+launchctl print gui/$(id -u)/com.thomasmaerz.cognee-backfill
+tail -f var/log/backfill.out.log
 ```
 
-Stop and restart the same command at any time. Accepted notes are persisted to
-`var/distilled/<session-id>.md`; `progress.json` records pipeline state.
+Manual and non-macOS execution remains available:
+
+```bash
+python3 backfill.py --dataset knowledge_base --improve
+```
+
+Stop and restart the service or manual command at any time. Normalized model
+inputs are persisted to `var/transcripts/<session-id>.md`; accepted notes are
+persisted to `var/distilled/<session-id>.md`; `progress.json` records only
+distillation state. Cognee owns content deduplication and processing status.
 
 Every skipped source ID remains in `progress.json` and in the review-friendly
 `var/skipped.json` manifest. Re-evaluate them later with:
@@ -198,7 +223,10 @@ for monitoring, backups, cleanup, and verification criteria.
 | Guarantee | Implementation |
 |---|---|
 | Source isolation | SQLite is opened with `mode=ro`; connectors never mutate history |
-| Resume safety | Notes reach disk before their state becomes `distilled` |
+| Resume safety | Model inputs and notes reach disk before their state becomes `distilled` |
+| Deterministic chronology | Sessions are prepared oldest-first with stable ID tie-breaking |
+| Bounded backend load | Batched `add` is followed by one Cognify run with explicit concurrency |
+| Backend idempotency | Cognee content hashes and per-item pipeline status make reruns safe |
 | Conservative junk filtering | Work history is retained even without a decision; only empty handshakes, pings, and sessions with no meaningful activity are discarded |
 | Retryable failures | Distillation and submission errors remain eligible for retry |
 | Secret defense-in-depth | Common keys, tokens, passwords, and private-key markers are redacted |
@@ -239,9 +267,15 @@ before changing model families.
 | `COGNEE_API_URL` | `http://localhost:8010` | Cognee API endpoint |
 | `OPENCODE_DB` | `~/.local/share/opencode/opencode.db` | Read-only OpenCode source |
 | `--concurrency` | `4` | Parallel distillation workers |
+| `--add-batch-size` | `100` | Documents per idempotent Add request |
+| `--data-per-batch` | `4` | Documents Cognee processes concurrently |
+| `--chunks-per-batch` | `12` | Chunks per Cognee task batch |
 | `--limit`, `--offset` | unset | Smoke testing and manual sharding |
 | `--reparse-skipped` | off | Re-evaluate every session currently classified as junk |
-| `--reparse-all` | off | Re-distill all non-remembered sessions |
+| `--reparse-all` | off | Re-distill every retained session |
+
+`--reparse-all` changes document hashes. Use a new empty dataset, or delete the
+existing target dataset first, so old and replacement notes cannot coexist.
 
 The complete model, embedding, and structured-output matrix lives in
 **[Configuration](https://github.com/thomasmaerz/cognee-backfill/wiki/Configuration)**.
@@ -271,7 +305,7 @@ The complete model, embedding, and structured-output matrix lives in
 Every connector follows the same contract:
 
 ```text
-extract read-only history -> normalize and scrub -> distill -> persist -> submit
+extract oldest-first -> normalize, scrub, and persist -> distill -> batched add -> one cognify
 ```
 
 See **[Adding a connector](https://github.com/thomasmaerz/cognee-backfill/wiki/Adding-a-connector)**
